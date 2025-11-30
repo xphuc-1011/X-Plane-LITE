@@ -36,4 +36,214 @@
     </header>
 
     <div style="position:relative">
-      <div id="renderArea"><
+      <div id="renderArea"></div>
+      <div id="hud"><div class="panel">Speed: <span id="speedDisplay">0</span> kt<br>Alt: <span id="altDisplay">0</span> ft</div></div>
+      <div id="instruments"><div class="panel">Throttle: <span id="throttleDisplay">0%</span><br>Status: <span id="status">On Ground</span></div></div>
+    </div>
+
+    <div class="controls">
+      <div class="panel">Controls: W/S Pitch • A/D Roll • Q/E Yaw • R/F Throttle • G Gear</div>
+      <div class="panel">Camera: Mouse look while holding right mouse • Scroll to zoom</div>
+    </div>
+  </div>
+
+<script src="https://unpkg.com/three@0.154.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.154.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+// X-Plane LITE 3D — single-file prototype using three.js
+// Features: simple 3D aircraft (box), terrain grid, runway, chase camera, simplified physics
+
+const container = document.getElementById('renderArea');
+const scene = new THREE.Scene();
+// Lighting added
+const ambient = new THREE.AmbientLight(0xffffff, 1.2);
+scene.add(ambient);
+const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+sun.position.set(50,100,50);
+scene.add(sun);
+scene.fog = new THREE.FogExp2(0x0b2030, 0.0008);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(container.clientWidth, container.clientHeight);
+container.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.1, 5000);
+camera.position.set(0,5,20);
+
+// ambient + directional
+scene.add(new THREE.AmbientLight(0x909fb0, 0.6));
+const sun = new THREE.DirectionalLight(0xfff0d0, 0.9);
+sun.position.set(120,200,80);
+scene.add(sun);
+
+// ground (large plane with grid texture)
+const groundGeo = new THREE.PlaneGeometry(40000,40000, 200,200);
+const groundMat = new THREE.MeshStandardMaterial({color:0x1a4b2a, side:THREE.DoubleSide});
+const ground = new THREE.Mesh(groundGeo, groundMat); ground.rotation.x = -Math.PI/2; scene.add(ground);
+
+// runway: simple black plane with markings
+const runway = new THREE.Mesh(new THREE.PlaneGeometry(8000, 60), new THREE.MeshStandardMaterial({color:0x222222}));
+runway.rotation.x = -Math.PI/2; runway.position.set(0,0.01,0); scene.add(runway);
+// centerline markings
+for(let i=-3900;i<3900;i+=60){ const mark = new THREE.Mesh(new THREE.PlaneGeometry(30,4), new THREE.MeshStandardMaterial({color:0xffffff})); mark.rotation.x=-Math.PI/2; mark.position.set(i,0.02,0); scene.add(mark); }
+
+// simple skybox color via hemisphere
+const hemi = new THREE.HemisphereLight(0x66b7ff, 0x1c4b2a, 0.6); scene.add(hemi);
+
+// aircraft: a box with a tail and wings
+const plane = new THREE.Group();
+const body = new THREE.Mesh(new THREE.BoxGeometry(4.4,1.6,1.6), new THREE.MeshStandardMaterial({color:0x06f0d8})); body.position.set(0,0,0);
+const wing = new THREE.Mesh(new THREE.BoxGeometry(10,0.3,0.6), new THREE.MeshStandardMaterial({color:0x084d4b})); wing.position.set(0,0,0);
+const tail = new THREE.Mesh(new THREE.BoxGeometry(2,0.5,0.4), new THREE.MeshStandardMaterial({color:0x08333a})); tail.position.set(-2.8,0.7,0);
+plane.add(body, wing, tail);
+plane.position.set(0,3, -400);
+scene.add(plane);
+
+// camera chase controls (custom)
+let chaseOffset = new THREE.Vector3(0,6, -18);
+
+// simple instruments refs
+const speedEl = document.getElementById('speedDisplay');
+const altEl = document.getElementById('altDisplay');
+const thrEl = document.getElementById('throttleDisplay');
+const statusEl = document.getElementById('status');
+
+// physics state (3D)
+const state = {
+  pos: new THREE.Vector3(0,3,-400), // world
+  vel: new THREE.Vector3(40,0,0), // m/s in local forward (we'll map local forward to +X)
+  quat: new THREE.Quaternion(),
+  throttle: 0,
+  gearDown: true,
+  pitch:0, roll:0, yaw:0,
+  p:0,q:0,r:0
+};
+
+// aircraft physical params (scaled)
+const mass = 900;
+const wingArea = 16.2;
+const rho = 1.225;
+const maxThrust = 2600; // N
+
+// controls
+const keys = {};
+window.addEventListener('keydown', e=>{ keys[e.code]=true; if(e.code==='KeyG') state.gearDown = !state.gearDown; });
+window.addEventListener('keyup', e=>{ keys[e.code]=false; });
+
+function readControls(){
+  let pitchCmd = 0, rollCmd=0, yawCmd=0;
+  if(keys['KeyW']) pitchCmd = 1; if(keys['KeyS']) pitchCmd = -1;
+  if(keys['KeyA']) rollCmd = -1; if(keys['KeyD']) rollCmd = 1;
+  if(keys['KeyQ']) yawCmd = -1; if(keys['KeyE']) yawCmd = 1;
+  if(keys['KeyR']) state.throttle = Math.min(1, state.throttle + 0.007);
+  if(keys['KeyF']) state.throttle = Math.max(0, state.throttle - 0.007);
+  state.pitch += pitchCmd * 0.0015; state.roll += rollCmd * 0.002; state.yaw += yawCmd * 0.001;
+}
+
+// simple aerodynamic helpers
+function clFromAoA(aoa){ const aoaDeg = aoa*180/Math.PI; let cl = 0.1*aoaDeg; if(aoaDeg>14) return Math.max(0,1.4 - 0.08*(aoaDeg-14)); if(aoaDeg<-6) return Math.max(-0.3,-0.02*(-aoaDeg-6)); return cl; }
+function cdFromCl(cl){ const cd0=0.02,k=0.04; return cd0 + k*cl*cl; }
+
+// helper: local forward vector
+function forwardVector(){ const v = new THREE.Vector3(1,0,0); v.applyQuaternion(plane.quaternion); return v.normalize(); }
+function upVector(){ const v = new THREE.Vector3(0,0,1); v.applyQuaternion(plane.quaternion); return v.normalize(); }
+
+let last = performance.now();
+let playing = true; let assist = true;
+
+document.getElementById('assistBtn').addEventListener('click', ()=>{ assist = !assist; document.getElementById('assistBtn').textContent = 'Assist: ' + (assist? 'ON':'OFF'); });
+
+function step(dt){
+  readControls();
+  // rotation from state.pitch/roll/yaw (small angles integration)
+  const q = new THREE.Quaternion();
+  q.setFromEuler(new THREE.Euler(state.pitch, state.yaw, state.roll, 'YXZ'));
+  plane.quaternion.slerp(q, 0.06);
+
+  // get body axes
+  const fwd = forwardVector();
+  const up = upVector();
+
+  // compute speed scalar
+  const V = Math.max(0.1, state.vel.length());
+
+  // flight path angle approx
+  const flightPath = Math.asin(state.vel.z / V);
+  const aoa = plane.rotation.x - flightPath; // approximate
+
+  const cl = clFromAoA(aoa);
+  const cd = cdFromCl(cl);
+  const qdyn = 0.5 * rho * V * V;
+  const lift = cl * qdyn * wingArea;
+  const drag = cd * qdyn * wingArea;
+  const thrust = state.throttle * maxThrust;
+
+  // forces in world coords
+  const liftWorld = up.clone().multiplyScalar(lift);
+  const dragWorld = fwd.clone().multiplyScalar(-drag);
+  const thrustWorld = fwd.clone().multiplyScalar(thrust);
+  const weight = new THREE.Vector3(0,0,-mass*9.81);
+
+  const accel = new THREE.Vector3();
+  accel.add(liftWorld).add(dragWorld).add(thrustWorld).add(weight).divideScalar(mass);
+
+  // integrate velocity and position
+  state.vel.add(accel.multiplyScalar(dt));
+  state.pos.add(state.vel.clone().multiplyScalar(dt));
+
+  // set mesh pos
+  plane.position.copy(state.pos);
+
+  // camera chase (smooth)
+  const camTarget = state.pos.clone();
+  const camPos = state.pos.clone().add(new THREE.Vector3(0,8,-25).applyQuaternion(plane.quaternion));
+  camera.position.lerp(camPos, 0.08);
+  camera.lookAt(camTarget.clone().add(new THREE.Vector3(0,3,0)));
+
+  // simple ground collision
+  if(state.pos.y < -200) state.pos.y = -200; // lateral bounds
+  if(state.pos.z < 1.2){
+    // on or near ground
+    if(state.vel.length() < 8){ // gentle touchdown
+      state.pos.z = 1.2; state.vel.set(0,0,0); statusEl.textContent = 'Landed';
+    } else {
+      // crash
+      statusEl.textContent = 'Crashed'; playing = false;
+    }
+  } else {
+    statusEl.textContent = 'Airborne';
+  }
+
+  // assist leveling
+  if(assist){ plane.rotation.x *= 0.98; plane.rotation.z *= 0.98; }
+
+  // UI updates
+  speedEl.textContent = Math.round(state.vel.length() * 1.94384);
+  altEl.textContent = Math.round(state.pos.z * 3.28084);
+  thrEl.textContent = Math.round(state.throttle*100) + '%';
+}
+
+function animate(now){
+  const dt = Math.min(0.05, (now - last)/1000);
+  last = now;
+  if(playing){ step(dt); }
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// resize handling
+window.addEventListener('resize', ()=>{ renderer.setSize(container.clientWidth, container.clientHeight); camera.aspect = container.clientWidth/container.clientHeight; camera.updateProjectionMatrix(); });
+
+// simple reset
+document.getElementById('resetBtn').addEventListener('click', ()=>{ state.pos.set(0,3,-400); state.vel.set(40,0,0); state.throttle = 0; playing = true; statusEl.textContent='On Ground'; });
+
+document.getElementById('pauseBtn').addEventListener('click', ()=>{ playing = !playing; document.getElementById('pauseBtn').textContent = playing? 'Pause':'Resume'; });
+
+// initial state
+state.vel.set(40,0,0); state.throttle = 0.2; // taxi speed
+
+</script>
+</body>
+</html>
